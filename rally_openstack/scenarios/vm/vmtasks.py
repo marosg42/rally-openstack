@@ -141,7 +141,8 @@ class BootRuncommandDelete(vm_utils.VMScenario, cinder_utils.CinderBasic):
             image=None,
             command=None,
             volume_args=None, floating_network=None, port=22,
-            use_floating_ip=True, force_delete=False, wait_for_ping=True,
+            use_floating_ip=True, floating_ip=None,
+            force_delete=False, wait_for_ping=True,
             max_log_length=None, **kwargs):
         """Boot a server, run script specified in command and delete server.
 
@@ -221,6 +222,7 @@ class BootRuncommandDelete(vm_utils.VMScenario, cinder_utils.CinderBasic):
         :param floating_network: external network name, for floating ip
         :param port: ssh port for SSH connection
         :param use_floating_ip: bool, floating or fixed IP for SSH connection
+        :param floating_ip: specific floating IP to assign
         :param force_delete: whether to use force_delete for servers
         :param wait_for_ping: whether to check connectivity on server creation
         :param max_log_length: The number of tail nova console-log lines user
@@ -238,6 +240,7 @@ class BootRuncommandDelete(vm_utils.VMScenario, cinder_utils.CinderBasic):
         server, fip = self._boot_server_with_fip(
             image, flavor, use_floating_ip=use_floating_ip,
             floating_network=floating_network,
+            floating_ip=floating_ip,
             key_name=self.context["user"]["keypair"]["name"],
             **kwargs)
         try:

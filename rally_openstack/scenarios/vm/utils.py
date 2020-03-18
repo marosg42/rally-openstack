@@ -138,7 +138,8 @@ class VMScenario(nova_utils.NovaScenario):
         return ssh.execute(cmd, stdin=stdin)
 
     def _boot_server_with_fip(self, image, flavor, use_floating_ip=True,
-                              floating_network=None, **kwargs):
+                              floating_network=None, floating_ip=None,
+                              **kwargs):
         """Boot server prepared for SSH actions."""
         kwargs["auto_assign_nic"] = True
         server = self._boot_server(image, flavor, **kwargs)
@@ -151,7 +152,8 @@ class VMScenario(nova_utils.NovaScenario):
                 server.name)
 
         if use_floating_ip:
-            fip = self._attach_floating_ip(server, floating_network)
+            fip = self._attach_floating_ip(
+                server, floating_network, floating_ip=floating_ip)
         else:
             internal_network = list(server.networks)[0]
             fip = {"ip": server.addresses[internal_network][0]["addr"]}
@@ -161,14 +163,16 @@ class VMScenario(nova_utils.NovaScenario):
                         "is_floating": use_floating_ip}
 
     @atomic.action_timer("vm.attach_floating_ip")
-    def _attach_floating_ip(self, server, floating_network):
+    def _attach_floating_ip(self, server, floating_network, floating_ip=None):
         internal_network = list(server.networks)[0]
         fixed_ip = server.addresses[internal_network][0]["addr"]
 
         with atomic.ActionTimer(self, "neutron.create_floating_ip"):
-            fip = network_wrapper.wrap(self.clients, self).create_floating_ip(
+            fip = network_wrapper.wrap(self.clients,
+                                       self).create_floating_ip(
                 ext_network=floating_network,
-                tenant_id=server.tenant_id, fixed_ip=fixed_ip)
+                tenant_id=server.tenant_id, fixed_ip=fixed_ip,
+                floating_ip=floating_ip)
 
         self._associate_floating_ip(server, fip, fixed_address=fixed_ip)
 
