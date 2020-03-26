@@ -13,16 +13,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import json
 from rally.common import logging
+from rally import exceptions
+from rally.task import types
+from rally.task import utils as rally_utils
 from rally.task import validation
 
 from rally_openstack import consts
 from rally_openstack.contexts.manila import consts as manila_consts
 from rally_openstack import scenario
 from rally_openstack.scenarios.manila import utils
+from rally_openstack.scenarios.vm import utils as vm_utils
 
 
 """Scenarios for Manila shares."""
+
+LOG = logging.getLogger(__name__)
 
 
 @validation.add("enum", param_name="share_proto",
@@ -54,6 +61,126 @@ class CreateAndDeleteShare(utils.ManilaScenario):
             size=size,
             **kwargs)
         self.sleep_between(min_sleep, max_sleep)
+        self._delete_share(share)
+
+@types.convert(image={"type": "glance_image"},
+               flavor={"type": "nova_flavor"})
+@validation.add("image_valid_on_flavor", flavor_param="flavor",
+                image_param="image", fail_on_404_image=False)
+@validation.add("number", param_name="port", minval=1, maxval=65535,
+                nullable=True, integer_only=True)
+@validation.add("external_network_exists", param_name="floating_network")
+@validation.add("required_services", services=[consts.Service.MANILA,
+                                               consts.Service.NOVA])
+@validation.add("required_platform", platform="openstack", users=True)
+@scenario.configure(context={"cleanup@openstack": ["manila", "nova"],
+                             "keypair@openstack": {},
+                             "allow_ssh@openstack": None},
+                    name="ManilaShares.create_share_and_access_from_vm",
+                    platform="openstack")
+class CreateShareAndAccessFromVM(utils.ManilaScenario, vm_utils.VMScenario):
+    def run(self, image, flavor, username, size=1, password=None,
+            floating_network=None, port=22,
+            use_floating_ip=True, force_delete=False, max_log_length=None,
+            **kwargs):
+        """Create a share and access it from a VM.
+
+        - create NFS share
+        - launch VM
+        - authorize VM's fip to access the share
+        - mount share iside the VM
+        - write to share
+        - delete VM
+        - delete share
+
+        :param size: share size in GB, should be greater than 0
+
+        :param image: glance image name to use for the vm
+        :param flavor: VM flavor name
+        :param username: ssh username on server
+        :param password: Password on SSH authentication
+        :param floating_network: external network name, for floating ip
+        :param port: ssh port for SSH connection
+        :param use_floating_ip: bool, floating or fixed IP for SSH connection
+        :param force_delete: whether to use force_delete for servers
+        :param max_log_length: The number of tail nova console-log lines user
+                               would like to retrieve
+
+
+        :param kwargs: optional args to create a share or a VM
+        """
+        share_proto = 'nfs'
+        share = self._create_share(
+            share_proto=share_proto,
+            size=size,
+            **kwargs)
+        location = self._export_location(share)
+
+        server, fip = self._boot_server_with_fip(
+            image, flavor, use_floating_ip=use_floating_ip,
+            floating_network=floating_network,
+            key_name=self.context["user"]["keypair"]["name"],
+            userdata="#cloud-config\npackages:\n - nfs-common",
+            **kwargs)
+        self._allow_access_share(share, 'ip', fip['ip'], 'rw')
+        mount_opt = "-t nfs -o nfsvers=4.1,proto=tcp"
+        script = f"cloud-init status -w;" \
+                 f"sudo mount {mount_opt} {location[0]} /mnt || exit 1;" \
+                 f"sudo dd if=/dev/zero of=/mnt/testfile bs=1M count=250" \
+                 f" || exit 2; ls -l /mnt; df -h"
+
+        command = {
+            "script_inline": script,
+            "interpreter": "/bin/bash"
+        }
+        try:
+            rally_utils.wait_for_status(
+                server,
+                ready_statuses=["ACTIVE"],
+                update_resource=rally_utils.get_from_manager(),
+            )
+
+            code, out, err = self._run_command(
+                fip["ip"], port, username, password, command=command)
+            text_area_output = ["StdErr: %s" % (err or "(none)"),
+                                "StdOut:"]
+            if code:
+                raise exceptions.ScriptError(
+                    "Error running command %(command)s. "
+                    "Error %(code)s: %(error)s" % {
+                        "command": command, "code": code, "error": err})
+            # Let's try to load output data
+            try:
+                data = json.loads(out)
+                # 'echo 42' produces very json-compatible result
+                #  - check it here
+                if not isinstance(data, dict):
+                    raise ValueError
+            except ValueError:
+                # It's not a JSON, probably it's 'script_inline' result
+                data = []
+        except (exceptions.TimeoutException,
+                exceptions.SSHTimeout):
+            console_logs = self._get_server_console_output(server,
+                                                           max_log_length)
+            LOG.debug("VM console logs:\n%s" % console_logs)
+            raise
+
+        finally:
+            self._delete_server_with_fip(server, fip,
+                                         force_delete=force_delete)
+
+        if isinstance(data, dict) and set(data) == {"additive", "complete"}:
+            for chart_type, charts in data.items():
+                for chart in charts:
+                    self.add_output(**{chart_type: chart})
+        else:
+            # it's a dict with several unknown lines
+            text_area_output.extend(out.split("\n"))
+            self.add_output(complete={"title": "Script Output",
+                                      "chart_plugin": "TextArea",
+                                      "data": text_area_output})
+
         self._delete_share(share)
 
 
@@ -242,8 +369,9 @@ class ListShareServers(utils.ManilaScenario):
         self._list_share_servers(search_opts=search_opts)
 
 
-@validation.add("enum", param_name="share_proto", values=["nfs", "cephfs",
-                "cifs", "glusterfs", "hdfs"], missed=False,
+@validation.add("enum", param_name="share_proto",
+                values=["nfs", "cephfs", "cifs", "glusterfs", "hdfs"],
+                missed=False,
                 case_insensitive=True)
 @validation.add("required_services", services=[consts.Service.MANILA])
 @validation.add("required_platform", platform="openstack", users=True)

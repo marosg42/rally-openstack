@@ -79,6 +79,32 @@
           tenants: 2
           users_per_tenant: 1
     -
+      title: ManilaShares.create_share_and_access_from_vm tests
+      scenario:
+        ManilaShares.create_share_and_access_from_vm:
+          size: 1
+          share_type: "CephNFStype"
+          flavor:
+              name: "flavor_name"
+          image:
+              name: "image_name"
+          username: "ubuntu"
+      runner:
+        constant:
+          times: 1
+          concurrency: 1
+      contexts:
+        quotas:
+          manila:
+            shares: -1
+            gigabytes: -1
+        users:
+          tenants: 1
+          users_per_tenant: 1
+        network:
+          dns_nameservers:
+             - "1.1.1.1"
+    -
       title: ManilaShares.create_and_list_share tests
       scenario:
         ManilaShares.create_and_list_share:

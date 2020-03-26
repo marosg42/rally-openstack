@@ -15,7 +15,9 @@
 
 import ddt
 import mock
+from mock import patch
 
+from rally import exceptions
 from rally_openstack.scenarios.manila import shares
 from tests.unit import test
 
@@ -40,6 +42,196 @@ class ManilaSharesTestCase(test.ScenarioTestCase):
         scenario._create_share.assert_called_once_with(**params)
         scenario.sleep_between.assert_called_once_with(3, 4)
         scenario._delete_share.assert_called_once_with(fake_share)
+
+    def create_env(self, scenario):
+        fake_share = mock.MagicMock()
+        scenario = shares.CreateShareAndAccessFromVM(self.context)
+        self.ip = {"id": "foo_id", "ip": "foo_ip", "is_floating": True}
+        scenario._boot_server_with_fip = mock.Mock(
+            return_value=("foo_server", self.ip))
+        scenario._delete_server_with_fip = mock.Mock()
+        scenario._run_command = mock.MagicMock(
+            return_value=(0, "{\"foo\": 42}", "foo_err"))
+        scenario.add_output = mock.Mock()
+        self.context.update({"user": {"keypair": {"name": "keypair_name"},
+                                      "credential": mock.MagicMock()}})
+        scenario._create_share = mock.MagicMock(return_value=fake_share)
+        scenario._delete_share = mock.MagicMock()
+        scenario._export_location = mock.MagicMock(return_value="fake")
+        scenario._allow_access_share = mock.MagicMock()
+
+        return scenario, fake_share
+
+    @ddt.data(
+        {"image": "some_image",
+         "flavor": "m1.small", "username": "chuck norris"}
+    )
+    @patch("rally.task.utils.get_from_manager")
+    @patch("rally.task.utils.wait_for_status")
+    def test_create_share_and_access_from_vm(self, params, wfs, gfm):
+        scenario, fake_share = self.create_env(
+            shares.CreateShareAndAccessFromVM(self.context))
+        scenario.run(**params)
+
+        scenario._create_share.assert_called_once_with(
+            share_proto='nfs', size=1)
+        scenario._delete_share.assert_called_once_with(fake_share)
+        scenario._allow_access_share.assert_called_once_with(
+            fake_share, 'ip', 'foo_ip', 'rw')
+        scenario._export_location.assert_called_once_with(fake_share)
+        scenario._boot_server_with_fip.assert_called_once_with(
+            'some_image', 'm1.small', use_floating_ip=True,
+            floating_network=None, key_name='keypair_name',
+            userdata='#cloud-config\npackages:\n - nfs-common')
+        wfs.assert_called_once_with(
+            'foo_server', ready_statuses=['ACTIVE'], update_resource=mock.ANY)
+        scenario._delete_server_with_fip.assert_called_once_with(
+            'foo_server', {'id': 'foo_id', 'ip': 'foo_ip',
+                           'is_floating': True},
+            force_delete=False)
+        scenario.add_output.assert_called_once_with(
+            complete={"chart_plugin": "TextArea",
+                      "data": [
+                          "StdErr: foo_err",
+                          "StdOut:",
+                          "{\"foo\": 42}"],
+                      "title": "Script Output"})
+
+    @ddt.data(
+        {"image": "some_image",
+         "flavor": "m1.small", "username": "chuck norris"}
+    )
+    @patch("rally.task.utils.get_from_manager")
+    @patch("rally.task.utils.wait_for_status")
+    def test_create_share_and_access_from_vm_command_timeout(self,
+                                                             params,
+                                                             wfs, gfm):
+        scenario, fake_share = self.create_env(
+            shares.CreateShareAndAccessFromVM(self.context))
+
+        scenario._run_command.side_effect = exceptions.SSHTimeout()
+        self.assertRaises(exceptions.SSHTimeout,
+                          scenario.run,
+                          "foo_flavor", "foo_image", "foo_interpreter",
+                          "foo_script", "foo_username")
+        scenario._delete_server_with_fip.assert_called_once_with(
+            "foo_server", self.ip, force_delete=False)
+        self.assertFalse(scenario.add_output.called)
+
+    @ddt.data(
+        {"image": "some_image",
+         "flavor": "m1.small", "username": "chuck norris"}
+    )
+    @patch("rally.task.utils.get_from_manager")
+    @patch("rally.task.utils.wait_for_status")
+    def test_create_share_and_access_from_vm_wait_timeout(self,
+                                                          params, wfs, gfm):
+        scenario, fake_share = self.create_env(
+            shares.CreateShareAndAccessFromVM(self.context))
+
+        wfs.side_effect = exceptions.TimeoutException(
+            resource_type="foo_resource",
+            resource_name="foo_name",
+            resource_id="foo_id",
+            desired_status="foo_desired_status",
+            resource_status="foo_resource_status",
+            timeout=2)
+        self.assertRaises(exceptions.TimeoutException,
+                          scenario.run,
+                          "foo_flavor", "foo_image", "foo_interpreter",
+                          "foo_script", "foo_username")
+        scenario._delete_server_with_fip.assert_called_once_with(
+            "foo_server", self.ip, force_delete=False)
+        self.assertFalse(scenario.add_output.called)
+
+    @patch("rally_openstack.scenarios.manila.shares.json")
+    def test_create_share_and_access_from_vm_delete_json_fails(self,
+                                                               mock_json):
+        scenario, fake_share = self.create_env(
+            shares.CreateShareAndAccessFromVM(self.context))
+
+        mock_json.loads.side_effect = ValueError()
+        scenario.run("foo_image", "foo_flavor", "foo_interpreter",
+                     "foo_script", "foo_username")
+        scenario.add_output.assert_called_once_with(complete={
+            "chart_plugin": "TextArea", "data": ["StdErr: foo_err",
+                                                 "StdOut:", "{\"foo\": 42}"],
+            "title": "Script Output"})
+        scenario._delete_server_with_fip.assert_called_once_with(
+            "foo_server", self.ip, force_delete=False)
+
+    @ddt.data(
+        {"output": (0, "", ""),
+         "expected": [{"complete": {"chart_plugin": "TextArea",
+                                    "data": [
+                                        "StdErr: (none)",
+                                        "StdOut:",
+                                        ""],
+                                    "title": "Script Output"}}]},
+        {"output": (1, "{\"foo\": 42}", ""), "raises": exceptions.ScriptError},
+        {"output": (0, "[1, 2, 3, 4]", ""), "expected": []},
+        {"output": ("", 1, ""), "raises": TypeError},
+        {"output": (0, "{\"foo\": 42}", ""),
+         "expected": [{"complete": {"chart_plugin": "TextArea",
+                                    "data": [
+                                        "StdErr: (none)",
+                                        "StdOut:",
+                                        "{\"foo\": 42}"],
+                                    "title": "Script Output"}}]},
+        {"output": (0, "{\"additive\": [1, 2]}", ""),
+         "expected": [{"complete": {"chart_plugin": "TextArea",
+                                    "data": [
+                                        "StdErr: (none)",
+                                        "StdOut:", "{\"additive\": [1, 2]}"],
+                                    "title": "Script Output"}}]},
+        {"output": (0, "{\"complete\": [3, 4]}", ""),
+         "expected": [{"complete": {"chart_plugin": "TextArea",
+                                    "data": [
+                                        "StdErr: (none)",
+                                        "StdOut:",
+                                        "{\"complete\": [3, 4]}"],
+                                    "title": "Script Output"}}]},
+        {"output": (0, "{\"additive\": [1, 2], \"complete\": [3, 4]}", ""),
+         "expected": [{"additive": 1}, {"additive": 2},
+                      {"complete": 3}, {"complete": 4}]}
+    )
+    @ddt.unpack
+    def test_create_share_and_access_from_vm_add_output(self, output,
+                                                        expected=None,
+                                                        raises=None):
+        scenario, fake_share = self.create_env(
+            shares.CreateShareAndAccessFromVM(self.context))
+
+        scenario._run_command.return_value = output
+        kwargs = {"flavor": "foo_flavor",
+                  "image": "foo_image",
+                  "username": "foo_username",
+                  "password": "foo_password",
+                  "use_floating_ip": "use_fip",
+                  "floating_network": "ext_network",
+                  "force_delete": "foo_force"}
+        if raises:
+            self.assertRaises(raises, scenario.run, **kwargs)
+            self.assertFalse(scenario.add_output.called)
+        else:
+            scenario.run(**kwargs)
+            calls = [mock.call(**kw) for kw in expected]
+            scenario.add_output.assert_has_calls(calls, any_order=True)
+
+            scenario._create_share.assert_called_once_with(
+                share_proto='nfs', size=1)
+            scenario._delete_share.assert_called_once_with(fake_share)
+            scenario._allow_access_share.assert_called_once_with(
+                fake_share, 'ip', 'foo_ip', 'rw')
+            scenario._export_location.assert_called_once_with(fake_share)
+            scenario._boot_server_with_fip.assert_called_once_with(
+                'foo_image', 'foo_flavor', use_floating_ip='use_fip',
+                floating_network='ext_network', key_name='keypair_name',
+                userdata='#cloud-config\npackages:\n - nfs-common')
+            scenario._delete_server_with_fip.assert_called_once_with(
+                'foo_server',
+                {'id': 'foo_id', 'ip': 'foo_ip', 'is_floating': True},
+                force_delete='foo_force')
 
     @ddt.data(
         {},
